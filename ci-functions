@@ -1,0 +1,258 @@
+#!/bin/bash 
+#####################
+
+#force debug mode regardless of context
+#CI_MODE='debug'
+
+##################### defaults
+
+CI_MODE=${CI_MODE:-'default'}
+
+CI_BOOTS_PATH=${CI_BOOTS_PATH:-'/mnt/apprenda-bootstrap'}
+CI_BOOTS_SHARE=${CI_BOOTS_SHARE:-'//zethos/PublishedArtifacts/BuildTools/Bootstrap/Linux'}
+
+#default share user
+CI_MOUNT_DOMAIN=${CI_MOUNT_DOMAIN:-'apprenda'}
+CI_MOUNT_USER=${CI_MOUNT_USER:-'saasgridsystem'}
+CI_MOUNT_PASS=${CI_MOUNT_PASS:-'@ppm5205'}
+
+
+##################### platform paths
+CI_APPRENDA_BINPATH=${CI_APPRENDA_BINPATH:-'/apprenda/core/bin'}
+
+##################### constants 
+CI_OSID_UNKNOWN=0
+CI_OSID_RHEL6=1
+CI_OSID_RHEL5=2
+CI_OSID_CENT6=3
+
+
+##################### mode values
+
+case "$CI_MODE" in
+
+ ##------ debug mode
+ debug)
+  echo '------ ci-functions: DEBUG MODE';
+  CI_BOOTS_PATH='/mnt/derektest';
+  CI_BOOTS_SHARE='//zethos/PublishedArtifacts/BuildTools/Bootstrap';
+  ;;
+ 
+ default|*)
+  #echo 'ci functions: default'
+ ;;
+esac
+
+
+
+##################### functions
+#verbage...
+#safe == only does things if its sure it wont screw things up
+#force == obliterates any relavent existing things and then restarts
+
+#adds cert to jre keystore
+#defaulted args: 
+# 1:jrepath 
+# 2:certpath
+add_cert_to_jre()
+{
+	#default args
+	local jre_path=${1:-'/apprenda/core/jre1.6.0_34'}
+	local cert_path=${2:-"${CI_BOOTS_PATH}/Apprenda.cer"}	
+	
+	#sanity check
+	if [ ! -d "$jre_path" ]; then
+	  echo "add_cert_to_jre(): error: jre path $jre_path doesnt exist";      
+	  return 1;
+	fi
+	
+	#copy the cert to tmp
+	cp "${cert_path}" "/tmp/Apprenda.cer"
+	if [ $? -ne 0 ]; then 
+	  echo "add_cert_to_jre(): error: unable to copy cert to temp";      
+	  return 1;
+	fi;
+	
+	
+	#run keytool
+	pushd "${jre_path}" > /dev/null	
+	local keytool_output=$(./bin/keytool -import -file '/tmp/Apprenda.cer' -keystore './lib/security/cacerts' -storepass 'changeit' -noprompt 2>&1)
+	local keytool_exit="$?"
+	popd > /dev/null
+	
+	
+	#error checking 
+	#-all good
+	if [ $keytool_exit -eq 0 ]; then
+	  echo 'ci-trust-apprenda-cert successful'
+	  return 0;
+	fi;
+
+	#-warn, do not fail if already exists
+	local exist_msg_count=$(echo "$keytool_output" | grep -i -c -P '^keytool error: java.lang.Exception: Certificate not imported, alias.*already exists')
+	if [ $exist_msg_count -gt 0 ]; then
+	 echo 'add_cert_to_jre(): warning: certificate already exists in store - nothing to do'
+	 return 0;
+	else
+	 echo "${keytool_output}"
+	 echo "add_cert_to_jre(): error: keytool returned ${keytool_exit}"	 
+	 return 1; 
+	fi;
+	
+}
+
+#identifies all apprenda-verified OSs
+fingerprint_os()
+{
+  local os_version=$(cat /etc/redhat-release)
+  if [[ $(echo "$os_version" | grep -i -c -P '^red hat enterprise linux server release 6.*') -gt 0 ]]; then
+   echo "fingerprint_os(): RHEL 6";
+   return $CI_OSID_RHEL6;
+  elif [[ $(echo "$os_version" | grep -i -c -P '^red hat enterprise linux server release 5.*') -gt 0 ]]; then
+   echo "fingerprint_os(): RHEL 5"
+   return $CI_OSID_RHEL5;
+  elif [[ $(echo "$os_version" | grep -i -c -P '^centos release 6.*') -gt 0 ]]; then
+   echo "fingerprint_os(): CentOS 6"
+   return $CI_OSID_CENT6;
+  else
+   echo "fingerprint_os(): unknown"
+   return $CI_OSID_UNKNOWN;
+  fi;	
+}
+
+
+#mounts a share if it isnt already
+#args: share mount [user pass domain]
+safe_mount_share()
+{
+  #required args
+  local share_path="$1"
+  if [ -z "$share_path" ]; then echo 'safe_mount_share(): error: no share specified to mount';  return 1;  fi;
+  local mount_path="$2"
+  if [ -z "$mount_path" ]; then echo 'safe_mount_share(): error: no mount point specified';  return 1;  fi;
+
+  #default args
+  local mount_user=${3:-$CI_MOUNT_USER}
+  local mount_pass=${4:-$CI_MOUNT_PASS}
+  local mount_domain=${5:-$CI_MOUNT_DOMAIN}
+
+  
+  if [ ! -e "${mount_path}" ]; then
+    mkdir -p ${mount_path};
+  fi;
+
+  #dont mount if already mounted
+  local cur_mounts=$(mount | grep -i -c -P "\s*${share_path}\s+on\s+${mount_path}\s+")
+
+  if [ $cur_mounts -gt 0 ]; then
+    #echo "safe_mount_share(): warning: found ${cur_mounts} active mounts for ${share_path} on ${mount_path} - nothing to do."
+   return 0;
+  fi;
+
+  mount -t cifs "${share_path}" "${mount_path}" -o username=${mount_user},password=${mount_pass},domain=${mount_domain};
+  return $?;
+
+}
+
+#persists a mount via fstab, only if entry DNE
+#args: share mount [user pass domain]
+safe_persist_mount()
+{
+  #required params
+  local share_path="$1"
+  if [ -z "$share_path" ]; then echo 'safe_persist_mount(): error: no share specified';  return 1;  fi;
+
+  local mount_path="$2"
+  if [ -z "$mount_path" ]; then echo 'safe_persist_mount(): error: no mount point specified';  return 1;  fi;
+
+  #default params
+  local mount_user=${3:-$CI_MOUNT_USER}
+  local mount_pass=${4:-$CI_MOUNT_PASS}
+  local mount_domain=${5:-$CI_MOUNT_DOMAIN} 
+
+
+  local fstab_count=$(grep -i -c -P "\s*${share_path}\s+${mount_path}\s+" /etc/fstab)
+
+  if [ $fstab_count -gt 0 ]; then	  
+    #echo "safe_persist_mount(): warning: found ${fstab_count} existing persistent mounts for ${share_path} on ${mount_path} - nothing to do."
+    return 0;
+  fi;
+
+  rm -f /etc/fstab.bk
+  cp -f /etc/fstab /etc/fstab.bk
+
+  grep -i -v -P "\s*${share_path}\s+${mount_path}\s+" /etc/fstab.bk > /etc/fstab
+  echo -e "${share_path}\t${mount_path}\tcifs\tusername=${mount_user},password=${mount_pass},domain=${mount_domain}\t0 0" >> /etc/fstab 
+
+  return $?;	
+
+}
+
+#un-persists (desists) a mount via removing it from fstab
+#args: mountpath
+desist_mount()
+{
+  #required params
+  local mount_path="$1"
+  if [ -z "$mount_path" ]; then echo 'desist_mount(): error: no mount specified';  return 1;  fi;
+
+  rm -f /etc/fstab.bk
+  cp -f /etc/fstab /etc/fstab.bk
+
+  grep -i -v -P "\s+${mount_path}\s+" /etc/fstab.bk > /etc/fstab 
+
+  return $?;
+}
+
+
+#unmounts all shares given a mount point 
+#no trailing slash on mountpath
+#args: mountpath 
+unmount_share()
+{ 
+  #required params
+  local mount_path="$1"
+
+  if [ -z "$mount_path" ]; then echo 'unmount_share(): error: no mount path specified';  return 1;  fi;
+
+
+  local init_mounts=$(mount | grep -i -c -P "\s+${mount_path}\s+")
+
+  if [ $init_mounts -le 0 ]; then
+    #echo "unmount_share(): warning: nothing mounted at ${mount_path} - nothing to do."
+    return 0;
+  fi
+
+  #unmount until none left, or we fail to decrease the count
+  local prev_mounts=$init_mounts;
+
+  while :
+  do
+ 
+  #umount -f "$mount_path" #force will sometimes will hang, and fails if anything is in use
+  umount -l "$mount_path"
+ 
+  sleep 1
+  local cur_mounts=$(mount | grep -i -c -P "\s+${mount_path}\s+")
+
+  if [ $cur_mounts -le 0 ]; then  
+   #no mounts left...done
+   break;
+  elif [ $cur_mounts -ge $prev_mounts ]; then
+   echo "unmount_share(): error: unable to unmount all filesystems on ${mount_path}";      
+   return 1;
+   break;
+  else  
+   prev_mounts=$cur_mounts
+  fi;
+
+  done
+
+return 0;
+
+}
+
+
+
+
+
